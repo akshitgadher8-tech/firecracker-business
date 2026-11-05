@@ -738,6 +738,10 @@ async function syncFirestoreNow(showMessage=false){
 }
 async function bootSharedDatabase(){
   sharedBooting=true;
+  if(staticHostingFallback){
+    sharedBooting=false;
+    return;
+  }
   const loaded=await pullSharedData();
   if(!loaded && /^https?:$/i.test(location.protocol)){
     normalizeSharedData();
@@ -884,7 +888,7 @@ function saveAll(){
   saveLegacyActiveData();
   if(activeBusinessId)saveBusinessSnapshot(activeBusinessId);
   if(activeBusinessId && typeof window.saveAllDataToFirestore==="function")window.saveAllDataToFirestore();
-  if(!sharedBooting && !sharedSuppressSave && /^https?:$/i.test(location.protocol))setTimeout(()=>pushSharedData(),0);
+  if(!sharedBooting && !sharedSuppressSave && !staticHostingFallback && /^https?:$/i.test(location.protocol))setTimeout(()=>pushSharedData(),0);
 }
 function auditStamp(bySession=session){
   const at=new Date().toISOString();
@@ -1104,6 +1108,7 @@ if(!adminAccount){
 }
 let businessRegistry=read(BUSINESS_REGISTRY_STORE,[]);
 let activeBusinessId=null;
+let staticHostingFallback=false;
 function defaultBusinessSettings(name){return {...settings,businessName:name||"Firecracker"}}
 function businessDataSnapshot(){
   return {schema:2,businessId:activeBusinessId,license:(businessById(activeBusinessId)?.license||null),products,sales,customers,expenses,settings,invoiceCounter,accounts,closings,transactions,activity,ownerCashWithdrawals,ownerItemWithdrawals,stockLedger,stockTransfers,billDrafts};
@@ -1153,12 +1158,13 @@ function ensureBusinessRegistry(){
 }
 function businessById(id){return businessRegistry.find(b=>String(b.id)===String(id))}
 async function pullBusinessRegistry(){
-  // In a Capacitor APK, JSON files must be bundled under www/. Load the
-  // bundled registry first. On a browser/SHTTP build, load the live server file.
+  // Capacitor uses bundled JSON; HTTP deployments load the registry when the
+  // host supports it and fall back to browser-local accounts on static hosts.
   if(!IS_NATIVE_APP && !IS_HTTP_RUNTIME)return businessRegistry;
   try{
     const r=await fetch(new URL("business_registry.json",location.href).href+"?t="+Date.now(),{cache:"no-store",credentials:"same-origin"});
-    if(r.ok){const d=await r.json();if(Array.isArray(d)){businessRegistry=d;write(BUSINESS_REGISTRY_STORE,businessRegistry);return businessRegistry}}
+    if(r.ok){const d=await r.json();if(Array.isArray(d)){staticHostingFallback=false;businessRegistry=d;write(BUSINESS_REGISTRY_STORE,businessRegistry);return businessRegistry}}
+    if(r.status===404||r.status===405)staticHostingFallback=true;
   }catch(e){}
   return businessRegistry;
 }
@@ -1468,12 +1474,25 @@ async function verifyBusinessServerState(b){
   let registry=null;
   try{
     const r=await fetch(new URL("business_registry.json",location.href).href+"?t="+Date.now(),{cache:"no-store",credentials:"same-origin"});
-    if(!r.ok)return false;
+    if(!r.ok){
+      if((r.status===404||r.status===405)&&businessRegistry.length){
+        staticHostingFallback=true;
+        const cached=businessById(b.id);
+        if(!cached)return false;
+        const cachedLicense=licenseStatusInfo(cached);
+        if(cached.status!=="active"||["suspended","removed","expired"].includes(cachedLicense.status)){
+          showSubscriptionRequired(cached,cachedLicense.status);return false;
+        }
+        return true;
+      }
+      return false;
+    }
     registry=await r.json();
   }catch(e){return false}
   if(!Array.isArray(registry))return false;
   const remote=registry.find(x=>String(x?.id)===String(b.id));
   if(!remote)return false;
+  staticHostingFallback=false;
   businessRegistry=registry;
   write(BUSINESS_REGISTRY_STORE,businessRegistry);
   const l=licenseStatusInfo(remote);
@@ -1578,18 +1597,18 @@ async function login(){
 
     ensureBusinessRegistry();
     if(IS_NATIVE_APP){try{await pullBusinessRegistry()}catch(e){}}
-    // License state is security-critical. Always refresh the shared registry
-    // before authenticating a business account so a suspension/expiry cannot
-    // be bypassed by stale local cached data.
+    // Refresh the registry when the host serves it. Static hosts cannot create
+    // or update JSON files, so they use the cached browser registry instead.
     if(/^https?:$/i.test(location.protocol)){
-      // License state is security-critical. Do not authenticate from a stale
-      // cached registry. If the shared registry cannot be verified, fail closed.
       let verified=false;
       try{
         const r=await fetch(new URL("business_registry.json",location.href).href+"?t="+Date.now(),{cache:"no-store",credentials:"same-origin"});
         if(r.ok){
           const remote=await r.json();
-          if(Array.isArray(remote)){businessRegistry=remote;write(BUSINESS_REGISTRY_STORE,businessRegistry);verified=true}
+          if(Array.isArray(remote)){staticHostingFallback=false;businessRegistry=remote;write(BUSINESS_REGISTRY_STORE,businessRegistry);verified=true}
+        }else if((r.status===404||r.status===405)&&businessRegistry.length){
+          staticHostingFallback=true;
+          verified=true;
         }
       }catch(e){verified=false}
       if(!verified){showError('Unable to verify your subscription. Please check the shared server connection and try again.');return false}
@@ -2829,7 +2848,8 @@ function deviceSyncPage(){if(!requirePermission("deviceSync"))return;
     `<div class="panel"><h3>Shared SHTTP Database</h3>
       <div class="summary-row"><span>Shared Database</span><strong>${esc(SHARED_DB_FILE)}</strong></div>
       <div class="summary-row"><span>Server</span><strong>${esc(location.origin)}</strong></div>
-      <div class="summary-row"><span>Status</span><strong>${sharedDbReady?"🟢 Connected":"🟡 Local fallback"}</strong></div>
+      <div class="summary-row"><span>Status</span><strong>${sharedDbReady?"🟢 Connected":staticHostingFallback?"🟡 Static hosting":"🟡 Local fallback"}</strong></div>
+      ${staticHostingFallback?'<div class="small">This static host cannot store shared JSON files. Account data is cached in this browser; business data is synced to Firebase Firestore.</div>':""}
       <div class="small">All Owner and Staff accounts use this same shared_data.json file. Every device must open this app from the same SHTTP server URL. SHTTP must allow file modification/WebDAV.</div>
       <div class="btn-row" style="margin-top:10px"><button class="primary" onclick="syncSharedNow(true)">Sync Now</button><button class="secondary" onclick="pullSharedData().then(()=>deviceSyncPage())">Refresh</button></div>
     </div>`+
@@ -4011,7 +4031,7 @@ async function acquireAccountLock(accountId,kind,businessId,name){
   const id=String(accountId),token=uid()+"-"+Math.random().toString(36).slice(2),nowMs=Date.now();
   const meta={token,accountId:id,kind,businessId:businessId||"",name:name||"",device:getDeviceId(),createdAt:new Date(nowMs).toISOString(),expiresAt:nowMs+ACCOUNT_LOCK_TTL,updatedAt:new Date(nowMs).toISOString()};
 
-  if(IS_NATIVE_APP || !/^https?:$/i.test(location.protocol)){
+  if(IS_NATIVE_APP || staticHostingFallback || !/^https?:$/i.test(location.protocol)){
     const locks=lockStore(),existing=locks[id];
     // Native/offline builds have only device-local locking. If the same device
     // already owns the lock (for example after reopening the APK), refresh it
@@ -4065,7 +4085,7 @@ async function clearBusinessActiveSession(){
 async function renewAccountLock(){
   if(!session?.id||!session.lockToken)return;
   const id=String(session.id),token=session.lockToken;
-  if(!IS_NATIVE_APP && /^https?:$/i.test(location.protocol)){
+  if(!IS_NATIVE_APP && !staticHostingFallback && /^https?:$/i.test(location.protocol)){
     try{
       const x=await fetchAccountLock(id);
       if(!x || x.token!==token){await logout();return}
@@ -4088,7 +4108,7 @@ async function releaseAccountLock(){
   if(!session?.id||!session?.lockToken)return;
   const id=String(session.id),token=session.lockToken;
   clearLocalLock(id,token);
-  if(!IS_NATIVE_APP && /^https?:$/i.test(location.protocol)){
+  if(!IS_NATIVE_APP && !staticHostingFallback && /^https?:$/i.test(location.protocol)){
     try{
       const x=await fetchAccountLock(id);
       if(x&&x.token===token)await deleteServerAccountLock(id,x._etag||"");
